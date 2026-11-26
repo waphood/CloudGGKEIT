@@ -2,13 +2,14 @@ import base64
 import json
 import logging
 import os
+import secrets
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
 from roles import ADMIN, LEADER, ROLES, STUDENT, Roles
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 
 UPLOAD = "📤 Загрузить"
 DOWNLOAD = "📥 Скачать"
@@ -42,12 +43,36 @@ DENY = "Запретить загрузку"
 CONFIRM = "Подтвердить удаление"
 
 
-async def keyboard(message, prompt, labels):
-    await message.reply_text(prompt, reply_markup=ReplyKeyboardMarkup(
-        [[label] for label in labels], resize_keyboard=True))
+class Screen:
+    def __init__(self, update, context):
+        self.message = update.effective_message
+        self.query = update.callback_query
+        self.chat = context.chat_data
+
+    async def show(self, prompt, rows):
+        version = secrets.token_hex(6)
+        actions = {}
+        keys = []
+        for row in rows:
+            buttons = []
+            for label in row:
+                code = f"{version}.{len(actions)}"
+                actions[code] = label
+                buttons.append(InlineKeyboardButton(label, callback_data=code))
+            keys.append(buttons)
+        if self.query:
+            await self.query.edit_message_text(prompt, reply_markup=InlineKeyboardMarkup(keys))
+            message_id = self.message.message_id
+        else:
+            sent = await self.message.reply_text(prompt, reply_markup=InlineKeyboardMarkup(keys))
+            message_id = sent.message_id
+        self.chat.update(menu_id=message_id, actions=actions)
+
+    async def keyboard(self, prompt, labels):
+        await self.show(prompt, [[label] for label in labels])
 
 
-async def choices(message, state, items, stage, page=0):
+async def choices(screen, state, items, stage, page=0):
     start = page * 12
     visible = items[start:start + 12]
     buttons = {f"{i}. {name[:60]}": name for i, name in enumerate(visible, start + 1)}
@@ -58,7 +83,11 @@ async def choices(message, state, items, stage, page=0):
         rows.append(navigation)
     rows.append([HOME])
     prompt = "Выберите предмет." if stage == "subject" else ("Выберите старосту." if stage == "leaders" else "Выберите файл.")
-    await message.reply_text(prompt, reply_markup=ReplyKeyboardMarkup(rows, resize_keyboard=True))
+    if stage == "file":
+        prompt = f"📁 {state['subject']}\n{prompt}"
+    if len(items) > 12:
+        prompt += f" · {page + 1}/{(len(items) + 11) // 12}"
+    await screen.show(prompt, rows)
 
 
 async def handle(update, context):
@@ -66,7 +95,19 @@ async def handle(update, context):
     state = context.user_data
     user = update.effective_user
     uid = user.id
-    text = message.text or ""
+    screen = Screen(update, context)
+    query = update.callback_query
+    if query:
+        text = context.chat_data.get("actions", {}).get(query.data)
+        if not text or context.chat_data.get("menu_id") != message.message_id:
+            await query.answer("Это меню устарело. Отправьте любое слово, чтобы открыть новое.")
+            return
+        await query.answer()
+    else:
+        text = message.text or ""
+        if not context.chat_data.get("keyboard_removed"):
+            await message.reply_text("Кнопки меню теперь под сообщениями.", reply_markup=ReplyKeyboardRemove())
+            context.chat_data["keyboard_removed"] = True
     roles = context.bot_data["roles"]
     subjects = context.bot_data["subjects"]
     if text.startswith("/start "):
@@ -80,22 +121,24 @@ async def handle(update, context):
         return await message.reply_text("Чтобы открыть материалы, перейдите по ссылке-ключу от администратора.",
                                         reply_markup=ReplyKeyboardRemove())
 
-    async def home(info="Выберите действие."):
+    async def home(info=None):
         state.clear()
         if role == STUDENT:
             state.update(stage="subject", mode=DOWNLOAD, buttons={s: s for s in subjects})
-            return await keyboard(message, info, subjects)
+            return await screen.keyboard(info or "📚 Предметы\nВыберите папку с материалами.", subjects)
         actions = [DOWNLOAD]
         if allowed:
             actions.append(UPLOAD)
         if role == ADMIN:
             actions.extend([DELETE, KEYS, LEADERS])
-        await keyboard(message, info, actions)
+        rows = [actions[:2]] + [[label] for label in actions[2:]]
+        await screen.show(info or f"📚 Учебные материалы\n{role} · Главное меню", rows)
 
     async def invite(granted, scope):
         key = roles.issue(granted, scope)
-        await home(f"Одноразовый ключ «{granted}». Перешлите ссылку получателю.\n"
+        await message.reply_text(f"Одноразовый ключ «{granted}». Перешлите ссылку получателю.\n"
                    f"https://t.me/{context.bot.username}?start={key}")
+        await home("Ключ готов. Перешлите сообщение со ссылкой.")
 
     stage = state.get("stage")
     selected = state.get("buttons", {}).get(text)
@@ -105,12 +148,12 @@ async def handle(update, context):
         if text == KEYS:
             state.clear()
             state["stage"] = "grant"
-            return await keyboard(message, "Выберите роль для ключа.", [*ROLES, HOME])
+            return await screen.keyboard("Выберите роль для ключа.", [*ROLES, HOME])
         if stage == "grant" and text in ROLES:
             if text != LEADER:
                 return await invite(text, [])
             state.update(stage="scope", scope=[])
-            return await keyboard(message, "Отметьте предметы старосты.", [*subjects, DONE, HOME])
+            return await screen.keyboard("Отметьте предметы старосты.", [*subjects, DONE, HOME])
         if stage == "scope":
             scope = state["scope"]
             if text == DONE and scope:
@@ -120,7 +163,7 @@ async def handle(update, context):
                     scope.remove(text)
                 else:
                     scope.append(text)
-            return await keyboard(message, "Выбрано: " + (", ".join(scope) or "пока ничего"),
+            return await screen.keyboard("Выбрано: " + (", ".join(scope) or "пока ничего"),
                                   [*subjects, DONE, HOME])
         if text == LEADERS:
             entries = roles.leaders()
@@ -129,11 +172,11 @@ async def handle(update, context):
             state.clear()
             state["leaders"] = {f"{name} ({i}) · {'запрещено' if blocked else 'разрешено'}": (i, blocked)
                                 for i, name, blocked in entries}
-            return await choices(message, state, list(state["leaders"]), "leaders")
+            return await choices(screen, state, list(state["leaders"]), "leaders")
         if stage == "leaders" and selected:
             target, blocked = state["leaders"][selected]
             state.update(stage="block", target=target, block=not blocked)
-            return await keyboard(message, selected, [ALLOW if blocked else DENY, HOME])
+            return await screen.keyboard(selected, [ALLOW if blocked else DENY, HOME])
         if stage == "block" and text == (DENY if state["block"] else ALLOW):
             roles.block(state["target"], state["block"])
             return await home("Права старосты обновлены.")
@@ -150,11 +193,11 @@ async def handle(update, context):
             return await home("Выберите предмет.")
         state.clear()
         state["mode"] = text
-        return await choices(message, state, allowed if text == UPLOAD else subjects, "subject")
+        return await choices(screen, state, allowed if text == UPLOAD else subjects, "subject")
     if text in (NEXT, PREV) and state.get("stage") in ("subject", "file", "leaders"):
         page = state["page"] + (1 if text == NEXT else -1)
         if 0 <= page * 12 < len(state["items"]):
-            return await choices(message, state, state["items"], state["stage"], page)
+            return await choices(screen, state, state["items"], state["stage"], page)
 
     selected = state.get("buttons", {}).get(text)
     if selected and state.get("stage") == "subject":
@@ -162,15 +205,15 @@ async def handle(update, context):
         state["folder"] = "materials/" + selected
         if state["mode"] == UPLOAD:
             state.update(stage="upload", buttons={})
-            return await message.reply_text(
+            return await screen.keyboard(
                 f"Прикрепите файл до 20 МБ для предмета «{selected}». Он появится в публичном репозитории.",
-                reply_markup=ReplyKeyboardMarkup([[HOME]], resize_keyboard=True))
+                [HOME])
         response = await github("GET", state["folder"])
         files = [] if response.status_code == 404 else response.raise_for_status().json()
         names = sorted(f["name"] for f in files if f["type"] == "file" and valid_name(f["name"]))
         if not names:
             return await home("В этой папке пока нет файлов.")
-        return await choices(message, state, names, "file")
+        return await choices(screen, state, names, "file")
 
     if selected and state.get("stage") == "file":
         path = state["folder"] + "/" + selected
@@ -179,7 +222,7 @@ async def handle(update, context):
             if role != ADMIN:
                 return await home("Недостаточно прав.")
             state.update(stage="confirm", path=path, sha=meta["sha"], buttons={})
-            return await keyboard(message, f"Удалить «{selected}» из папки «{state['subject']}»?", [CONFIRM, HOME])
+            return await screen.keyboard(f"Удалить «{selected}» из папки «{state['subject']}»?", [CONFIRM, HOME])
         if meta["size"] > 50 * 1024 * 1024:
             return await home("Файл превышает лимит Telegram. Скачать с GitHub: " + meta["html_url"])
         data = (await github("GET", path, raw=True, params={"ref": "main"})).raise_for_status().content
@@ -207,7 +250,7 @@ async def error(update, context):
     logging.warning("Ошибка обработки: %s", type(context.error).__name__)
     if update and update.effective_message:
         context.user_data.clear()
-        await keyboard(update.effective_message, "Не удалось завершить действие.", [HOME])
+        await Screen(update, context).keyboard("Не удалось завершить действие.", [HOME])
 
 
 def main():
@@ -225,6 +268,7 @@ def main():
             with roles.db:
                 roles.db.execute("INSERT OR IGNORE INTO members(id,name,role,subjects) VALUES (?,?,?,?)",
                                  (int(value), value, "Учитель", "[]"))
+    app.add_handler(CallbackQueryHandler(handle))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.Document.ALL), handle))
     app.add_error_handler(error)
     app.run_polling()
