@@ -43,6 +43,47 @@ DENY = "Запретить загрузку"
 CONFIRM = "Подтвердить удаление"
 
 
+SUBJECTS = "📚 Предметы"
+ADD_SUBJECT = "➕ Создать предмет"
+REMOVE_SUBJECT = "➖ Удалить предмет"
+
+
+async def read_catalog():
+    result = (await github("GET", "subjects.json")).raise_for_status().json()
+    names = json.loads(base64.b64decode(result["content"]))
+    if not isinstance(names, list) or not all(valid_name(name) for name in names):
+        raise ValueError("Проверьте subjects.json")
+    return names, result["sha"]
+
+
+async def load_catalog(app):
+    app.bot_data["subjects"], _ = await read_catalog()
+
+
+async def change_subject(subjects, name, *, remove):
+    for _ in range(3):
+        names, sha = await read_catalog()
+        subjects[:] = names
+        if remove:
+            if name not in names:
+                return "Предмет уже удалён."
+            names.remove(name)
+        else:
+            if any(item.casefold() == name.casefold() for item in names):
+                return "Предмет с таким названием уже есть."
+            names.append(name)
+        content = (json.dumps(names, ensure_ascii=False, indent=2) + "\n").encode()
+        result = await github("PUT", "subjects.json", json={
+            "sha": sha, "message": "Обновить список предметов",
+            "content": base64.b64encode(content).decode("ascii")})
+        if result.status_code == 409:
+            continue
+        result.raise_for_status()
+        subjects[:] = names
+        return f"Предмет «{name}» удалён из меню." if remove else f"Предмет «{name}» создан."
+    return "Список одновременно изменился. Повторите действие."
+
+
 class Screen:
     def __init__(self, update, context):
         self.message = update.effective_message
@@ -82,7 +123,7 @@ async def choices(screen, state, items, stage, page=0):
     if navigation:
         rows.append(navigation)
     rows.append([HOME])
-    prompt = "Выберите предмет." if stage == "subject" else ("Выберите старосту." if stage == "leaders" else "Выберите файл.")
+    prompt = "Выберите предмет." if stage in ("subject", "remove_subject") else ("Выберите старосту." if stage == "leaders" else "Выберите файл.")
     if stage == "file":
         prompt = f"📁 {state['subject']}\n{prompt}"
     if len(items) > 12:
@@ -125,12 +166,14 @@ async def handle(update, context):
         state.clear()
         if role == STUDENT:
             state.update(stage="subject", mode=DOWNLOAD, buttons={s: s for s in subjects})
+            if not subjects:
+                return await message.reply_text(info or "Предметов пока нет.")
             return await screen.keyboard(info or "📚 Предметы\nВыберите папку с материалами.", subjects)
         actions = [DOWNLOAD]
         if allowed:
             actions.append(UPLOAD)
         if role == ADMIN:
-            actions.extend([DELETE, KEYS, LEADERS])
+            actions.extend([SUBJECTS, DELETE, KEYS, LEADERS])
         rows = [actions[:2]] + [[label] for label in actions[2:]]
         await screen.show(info or f"📚 Учебные материалы\n{role} · Главное меню", rows)
 
@@ -144,7 +187,33 @@ async def handle(update, context):
     selected = state.get("buttons", {}).get(text)
     if text in (HOME, "/start"):
         return await home()
+    if state.get("subject") and state["subject"] not in subjects:
+        return await home("Этот предмет удалён из меню.")
     if role == ADMIN:
+        if stage == "new_subject" and not query:
+            name = text.strip()
+            reserved = {HOME, NEXT, PREV, DONE, UPLOAD, DOWNLOAD, DELETE, SUBJECTS,
+                        ADD_SUBJECT, REMOVE_SUBJECT, KEYS, LEADERS, CONFIRM, ALLOW, DENY}
+            if not valid_name(name) or name in reserved:
+                return await screen.keyboard("Введите название предмета без служебных символов.", [HOME])
+            return await home(await change_subject(subjects, name, remove=False))
+        if text == SUBJECTS:
+            state.clear()
+            state["stage"] = "catalog"
+            return await screen.keyboard("Управление предметами", [ADD_SUBJECT, REMOVE_SUBJECT, HOME])
+        if stage == "catalog" and text == ADD_SUBJECT:
+            state["stage"] = "new_subject"
+            return await screen.keyboard("Отправьте название нового предмета.", [HOME])
+        if stage == "catalog" and text == REMOVE_SUBJECT:
+            if not subjects:
+                return await home("Предметов пока нет.")
+            return await choices(screen, state, list(subjects), "remove_subject")
+        if stage == "remove_subject" and selected:
+            state.update(stage="confirm_subject", subject=selected, buttons={})
+            return await screen.keyboard(f"Удалить «{selected}» из меню? Файлы сохранятся на GitHub.",
+                                         [CONFIRM, HOME])
+        if stage == "confirm_subject" and text == CONFIRM:
+            return await home(await change_subject(subjects, state["subject"], remove=True))
         if text == KEYS:
             state.clear()
             state["stage"] = "grant"
@@ -194,13 +263,15 @@ async def handle(update, context):
         state.clear()
         state["mode"] = text
         return await choices(screen, state, allowed if text == UPLOAD else subjects, "subject")
-    if text in (NEXT, PREV) and state.get("stage") in ("subject", "file", "leaders"):
+    if text in (NEXT, PREV) and state.get("stage") in ("subject", "file", "leaders", "remove_subject"):
         page = state["page"] + (1 if text == NEXT else -1)
         if 0 <= page * 12 < len(state["items"]):
             return await choices(screen, state, state["items"], state["stage"], page)
 
     selected = state.get("buttons", {}).get(text)
     if selected and state.get("stage") == "subject":
+        if selected not in subjects:
+            return await home("Этот предмет удалён из меню.")
         state["subject"] = selected
         state["folder"] = "materials/" + selected
         if state["mode"] == UPLOAD:
@@ -254,15 +325,12 @@ async def error(update, context):
 
 
 def main():
-    subjects = json.loads((ROOT / "subjects.json").read_text(encoding="utf-8"))
-    if not isinstance(subjects, list) or not all(valid_name(s) for s in subjects):
-        raise ValueError("Проверьте названия предметов в subjects.json")
     if not os.environ.get("GITHUB_TOKEN"):
         raise ValueError("Укажите GITHUB_TOKEN")
-    app = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
+    app = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).post_init(load_catalog).build()
     admins = {int(s) for s in os.environ.get("ADMIN_IDS", "").split(",") if s.strip()}
     roles = Roles(os.getenv("ROLE_DB", "roles.sqlite3"), admins)
-    app.bot_data.update(subjects=subjects, roles=roles)
+    app.bot_data.update(roles=roles)
     for value in os.getenv("UPLOADER_IDS", "").split(","):
         if value.strip() and int(value) not in admins:
             with roles.db:
